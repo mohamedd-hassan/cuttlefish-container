@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+# cf - run Cuttlefish in a Docker container, with your build output owned by YOU
+#
+#   cf mount <dir>                    set the directory to mount into the container (saved)
+#   cf start                          create the container (first time) or start it
+#   cf stop                           stop the container (it is kept, so `start` is instant)
+#   cf rebuild                        remove the container, rebuild the image, recreate it
+#   cf remove                         remove the container (the image is kept)
+#   cf launch [images_dir] [tools]    run launch_cvd in the container as YOU
+#   cf shell                          open a shell in the container as YOU
+#   cf default [dir | --reset]        show / set / clear the default images dir
+#   cf mount [--reset]                show / clear the mount dir
+#
+# First-time setup:
+#   cf mount ~/aosp                   # a dir containing your AOSP tree(s) / out/ dirs
+#   cf default ~/aosp/out/target/product/vsoc_x86_64_only    # optional
+#   cf start && cf launch
+#
+# The mount dir is mounted at the SAME absolute path inside the container, so
+# every path you give `cf` means the same thing on both sides. It is only read
+# when the container is created; after changing it run `cf rebuild`.
+# Precedence: CF_MOUNT_DIR env > saved (~/.config/cf/mount_dir)
+#
+# Images dir precedence for `launch` (there is no built-in default):
+#   1. argument            cf launch <dir>
+#   2. environment         CF_IMAGES_DIR=<dir> cf launch
+#   3. saved default       cf default <dir>   (~/.config/cf/images_dir)
+# The tools dir defaults to <out>/host/linux-x86, derived from the standard AOSP
+# layout <out>/target/product/<product>; pass it explicitly if yours differs.
+# `launch` starts the container automatically if it isn't running.
+#
+# The container runs as root (the image's init needs that for taps/bridges), but
+# launch_cvd runs as your own uid, so nothing in out/ ever becomes root-owned.
+#
+# Install: this file doesn't depend on where it lives. Either copy it or symlink it:
+#   mkdir -p ~/.local/bin && ln -sf "$(realpath cf)" ~/.local/bin/cf
+set -euo pipefail
+
+if [[ $EUID -eq 0 ]]; then
+  echo "[!] Run this as your normal user, not root/sudo." >&2
+  exit 1
+fi
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"   # only used to print the usage text
+CONTAINER_NAME="cuttlefish"
+BASE_IMAGE="us-docker.pkg.dev/android-cuttlefish-artifacts/cuttlefish-orchestration/cuttlefish-orchestration:stable"
+IMAGE="cuttlefish-local:latest"
+HOST_USER="$(id -un)"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cf"
+
+die() { echo "[!] $*" >&2; exit 1; }
+
+# ==========================================================================
+# HOST SIDE (uses docker; never runs inside the container)
+# ==========================================================================
+
+conf_get()   { [[ -s "$CONF_DIR/$1" ]] && cat "$CONF_DIR/$1" || true; }
+conf_set()   { mkdir -p "$CONF_DIR" && printf '%s\n' "$2" > "$CONF_DIR/$1"; }
+conf_unset() { rm -f "$CONF_DIR/$1"; }
+
+is_running() {
+  [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)" == "true" ]]
+}
+
+tty_flag() { if [[ -t 0 && -t 1 ]]; then echo "-it"; else echo "-i"; fi; }
+
+usage() {
+  # print the leading comment block (everything up to the first non-comment line)
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF"
+  exit "${1:-0}"
+}
+
+# ---- start / rebuild ------------------------------------------------------
+cmd_start() {
+  local force_rebuild=0
+  if [[ "${1:-}" == "--rebuild" ]]; then
+    force_rebuild=1
+    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  fi
+
+  # Fast path: container already exists -> just start it.
+  if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+    echo "[+] '$CONTAINER_NAME' already exists - starting it"
+    docker start "$CONTAINER_NAME" >/dev/null
+    return 0
+  fi
+
+  # First-time setup: needs the mount dir, then builds the image and creates the container.
+  local mount_dir="${CF_MOUNT_DIR:-$(conf_get mount_dir)}"
+  [[ -n "$mount_dir" ]] || die "no mount dir set. Run: cf mount <dir containing your AOSP tree(s)>"
+  mount_dir="$(realpath -sm "$mount_dir")"
+  [[ -d "$mount_dir" ]] || die "mount dir does not exist: $mount_dir"
+
+  local host_uid host_gid
+  host_uid="$(id -u)"
+  host_gid="$(id -g)"
+
+  # Numeric gids that own the passed-through device nodes. With --privileged the
+  # nodes keep their *host* gid, so it must exist in the container and the user
+  # must be in it.
+  local gids=() dev
+  for dev in /dev/kvm /dev/vhost-vsock /dev/vhost-net /dev/net/tun \
+             /dev/dri/renderD* /dev/dri/card*; do
+    [[ -e "$dev" ]] && gids+=("$(stat -c %g "$dev")")
+  done
+  local extra_gids
+  extra_gids="$(printf '%s\n' "${gids[@]}" | awk '$1 != 0' | sort -un | xargs)"
+
+  local dockerfile_version=2   # bump whenever the embedded Dockerfile changes
+  local fingerprint="v${dockerfile_version}:${HOST_USER}:${host_uid}:${host_gid}:${extra_gids}"
+  local current_fp
+  current_fp="$(docker image inspect -f '{{ index .Config.Labels "cf.fingerprint" }}' "$IMAGE" 2>/dev/null || true)"
+
+  if [[ $force_rebuild -eq 1 || "$current_fp" != "$fingerprint" ]]; then
+    echo "[+] Building $IMAGE for '$HOST_USER' ($host_uid:$host_gid), extra gids: ${extra_gids:-none}"
+    docker build \
+      --label "cf.fingerprint=$fingerprint" \
+      --build-arg "BASE=$BASE_IMAGE" \
+      --build-arg "HOST_USER=$HOST_USER" \
+      --build-arg "HOST_UID=$host_uid" \
+      --build-arg "HOST_GID=$host_gid" \
+      --build-arg "EXTRA_GIDS=$extra_gids" \
+      -t "$IMAGE" - <<'DOCKERFILE'
+# BASE is always supplied via --build-arg; the default only silences a Docker lint warning.
+ARG BASE=scratch
+FROM ${BASE}
+ARG HOST_USER
+ARG HOST_UID
+ARG HOST_GID
+ARG EXTRA_GIDS
+
+# NOTE: no USER directive on purpose - the image's entrypoint must keep running
+# as root. We only create the account; `docker exec -u` selects it.
+#
+# 1. free the uid / username if the base image already uses them
+# 2. create the primary group + user with the host's ids
+# 3. join the user to every group that owns a passed-through device, by host gid
+#    (this is what grants actual access to the device nodes)
+# 4. ALSO join the image's own kvm / cvdnetwork / render / video groups by name
+#    (launch_cvd validates membership by group NAME, and those have different gids
+#    than on the host; cvdnetwork also owns the cuttlefish tap devices)
+RUN set -eux; \
+    for u in "$(getent passwd "$HOST_UID" | cut -d: -f1)" "$(id -nu "$HOST_USER" 2>/dev/null || true)"; do \
+        if [ -n "$u" ]; then userdel -r "$u" || true; fi; \
+    done; \
+    getent group "$HOST_GID" >/dev/null || groupadd -g "$HOST_GID" "hostgrp$HOST_GID"; \
+    useradd -m -u "$HOST_UID" -g "$HOST_GID" -s /bin/bash "$HOST_USER"; \
+    for g in $EXTRA_GIDS; do \
+        getent group "$g" >/dev/null || groupadd -g "$g" "hostgrp$g"; \
+        usermod -aG "$(getent group "$g" | cut -d: -f1)" "$HOST_USER"; \
+    done; \
+    for g in kvm cvdnetwork render video; do \
+        if getent group "$g" >/dev/null; then usermod -aG "$g" "$HOST_USER"; fi; \
+    done
+DOCKERFILE
+  fi
+
+  echo "[+] Creating '$CONTAINER_NAME' (mounting $mount_dir)"
+  # Mounted at the SAME absolute path as on the host: identical paths inside and
+  # outside, and not under /root (mode 700, unreachable for a non-root user).
+  docker run --privileged --network host \
+    --gpus all \
+    -e NVIDIA_DRIVER_CAPABILITIES=all \
+    --device /dev/kvm --device /dev/vhost-vsock \
+    -v /dev/log:/dev/log \
+    -v "${mount_dir}:${mount_dir}" \
+    --ulimit nofile=1048576:1048576 \
+    --name "$CONTAINER_NAME" \
+    -d "$IMAGE" >/dev/null
+}
+
+# ---- stop / remove --------------------------------------------------------
+cmd_stop()   { docker stop "$CONTAINER_NAME"; }
+cmd_remove() { docker rm -f "$CONTAINER_NAME"; }
+
+# ---- shell ----------------------------------------------------------------
+cmd_shell() {
+  is_running || cmd_start
+  exec docker exec "$(tty_flag)" -u "$HOST_USER" "$CONTAINER_NAME" bash
+}
+
+# ---- default images dir ---------------------------------------------------
+cmd_default() {
+  local d
+  case "${1:-}" in
+    "")
+      [[ -n "${CF_IMAGES_DIR:-}" ]] && echo "CF_IMAGES_DIR (env): $CF_IMAGES_DIR"
+      d="$(conf_get images_dir)"
+      echo "saved default: ${d:-(none)}"
+      ;;
+    --reset)
+      conf_unset images_dir
+      echo "[+] default images dir cleared"
+      ;;
+    *)
+      d="$(realpath -sm "$1")"
+      [[ -d "$d" ]] || die "not a directory: $d"
+      conf_set images_dir "$d"
+      echo "[+] default images dir: $d"
+      ;;
+  esac
+}
+
+# ---- mount dir ------------------------------------------------------------
+cmd_mount() {
+  local d
+  case "${1:-}" in
+    "")
+      [[ -n "${CF_MOUNT_DIR:-}" ]] && echo "CF_MOUNT_DIR (env): $CF_MOUNT_DIR"
+      d="$(conf_get mount_dir)"
+      echo "saved mount dir: ${d:-(none)}"
+      ;;
+    --reset)
+      conf_unset mount_dir
+      echo "[+] mount dir cleared"
+      ;;
+    *)
+      d="$(realpath -sm "$1")"
+      [[ -d "$d" ]] || die "not a directory: $d"
+      conf_set mount_dir "$d"
+      echo "[+] mount dir: $d"
+      if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+        echo "[i] the existing container keeps its old mount; run 'cf rebuild' to apply this one"
+      fi
+      ;;
+  esac
+}
+
+# ---- launch ---------------------------------------------------------------
+# Resolve paths here (they're identical inside the container), make sure the
+# container is up, then run launch_inner inside it as the host user.
+cmd_launch() {
+  local images tools images_in
+  # precedence: argument > CF_IMAGES_DIR > saved default (no built-in)
+  images_in="${1:-${CF_IMAGES_DIR:-$(conf_get images_dir)}}"
+  [[ -n "$images_in" ]] || die "no images dir. Pass one (cf launch <dir>), set CF_IMAGES_DIR, or run: cf default <dir>"
+  images="$(realpath -sm "$images_in")"
+  # .../out/target/product/<product> -> .../out/host/linux-x86
+  tools="$(realpath -sm "${2:-$images/../../../host/linux-x86}")"
+
+  [[ -d "$images" ]] || die "images dir not found: $images"
+
+  is_running || cmd_start
+
+  # Both dirs must sit under one of the container's bind mounts.
+  local mounts m ok_images=0 ok_tools=0
+  mounts="$(docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$CONTAINER_NAME")"
+  while IFS= read -r m; do
+    [[ -n "$m" ]] || continue
+    [[ "$images" == "$m" || "$images" == "$m"/* ]] && ok_images=1
+    [[ "$tools"  == "$m" || "$tools"  == "$m"/* ]] && ok_tools=1
+  done <<< "$mounts"
+  [[ $ok_images -eq 1 ]] || die "images dir isn't inside the container's mount: $images
+    mounted: $(echo "$mounts" | grep -v '^/dev/' | xargs)   (see 'cf mount', then 'cf rebuild')"
+  [[ $ok_tools -eq 1 ]] || die "tools dir isn't inside the container's mount: $tools"
+
+  [[ -x "$tools/bin/launch_cvd" ]] || die "launch_cvd not found in: $tools/bin"
+
+  # The inner logic is shipped as text (declare -f), so this file can live anywhere.
+  # (bash -c, not stdin, so launch_cvd's interactive prompt still works.)
+  exec docker exec "$(tty_flag)" -u "$HOST_USER" "$CONTAINER_NAME" \
+    bash -c "set -euo pipefail; $(declare -f launch_inner); launch_inner \"\$@\"" _ "$images" "$tools"
+}
+
+# ==========================================================================
+# CONTAINER SIDE (runs as the host user; must never call docker)
+# ==========================================================================
+
+launch_inner() {
+  local images="$1" tools="$2"
+  local runtime="/tmp/cvd-runtime-$(basename "$images")"
+  mkdir -p "$runtime"
+
+  # Convenience env for interactive shells (`cf shell`).
+  local env_file="$HOME/.cvd-env"
+  {
+    printf 'export HOST_TOOLS_DIR=%q\n' "$tools"
+    printf 'export IMAGES_DIR=%q\n' "$images"
+    printf 'export RUNTIME_DIR=%q\n' "$runtime"
+    printf 'export PATH=%q:$PATH\n' "$tools/bin"
+    printf 'export ANDROID_PRODUCT_OUT=%q\n' "$images"
+  } > "$env_file"
+  grep -qxF "source $env_file" "$HOME/.bashrc" 2>/dev/null || echo "source $env_file" >> "$HOME/.bashrc"
+
+  cd "$tools"
+  HOME="$tools" ./bin/launch_cvd \
+    -system_image_dir="$images" \
+    -instance_dir="$runtime"
+}
+
+# ==========================================================================
+# dispatch
+# ==========================================================================
+cmd="${1:-}"
+[[ $# -gt 0 ]] && shift
+
+case "$cmd" in
+  start)          cmd_start "$@" ;;
+  stop)           cmd_stop ;;
+  rebuild)        cmd_start --rebuild ;;
+  remove)         cmd_remove ;;
+  launch)         cmd_launch "$@" ;;
+  shell)          cmd_shell ;;
+  default)        cmd_default "$@" ;;
+  mount)          cmd_mount "$@" ;;
+  -h|--help|help) usage 0 ;;
+  *)              usage 1 ;;
+esac
