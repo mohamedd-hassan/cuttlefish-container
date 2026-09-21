@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cf - run Cuttlefish in a Docker container, with your build output owned by YOU
+# cf - run Cuttlefish in a Docker container
 #
 #   cf mount <dir>                    set the directory to mount into the container (saved)
 #   cf start                          create the container (first time) or start it
@@ -10,6 +10,7 @@
 #   cf shell                          open a shell in the container as YOU
 #   cf default [dir | --reset]        show / set / clear the default images dir
 #   cf mount [--reset]                show / clear the mount dir
+#   cf completion                     print the bash tab-completion script
 #
 # First-time setup:
 #   cf mount ~/aosp                   # a dir containing your AOSP tree(s) / out/ dirs
@@ -29,11 +30,18 @@
 # layout <out>/target/product/<product>; pass it explicitly if yours differs.
 # `launch` starts the container automatically if it isn't running.
 #
+# GPU (read when the container is created):
+#   CF_GPUS=auto   (default) pass the NVIDIA GPU through if the NVIDIA Container
+#                  Toolkit and driver are present, otherwise run without it
+#   CF_GPUS=none   never pass a GPU          CF_GPUS=all|<docker --gpus value>  force it
+#
 # The container runs as root (the image's init needs that for taps/bridges), but
 # launch_cvd runs as your own uid, so nothing in out/ ever becomes root-owned.
 #
 # Install: this file doesn't depend on where it lives. Either copy it or symlink it:
 #   mkdir -p ~/.local/bin && ln -sf "$(realpath cf)" ~/.local/bin/cf
+# Tab completion (bash):
+#   mkdir -p ~/.local/share/bash-completion/completions && cf completion > ~/.local/share/bash-completion/completions/cf
 set -euo pipefail
 
 if [[ $EUID -eq 0 ]]; then
@@ -90,6 +98,24 @@ cmd_start() {
   [[ -n "$mount_dir" ]] || die "no mount dir set. Run: cf mount <dir containing your AOSP tree(s)>"
   mount_dir="$(realpath -sm "$mount_dir")"
   [[ -d "$mount_dir" ]] || die "mount dir does not exist: $mount_dir"
+
+  # Preflight: fail early with a useful hint instead of a raw docker error.
+  [[ -e /dev/kvm ]] || die "/dev/kvm not found - enable virtualization (VT-x/AMD-V) in firmware and load the kvm module"
+  [[ -e /dev/vhost-vsock ]] || die "/dev/vhost-vsock not found - run: sudo modprobe vhost_vsock"
+
+  # GPU passthrough is optional: only ask Docker for it when it can work.
+  local gpu_args=()
+  case "${CF_GPUS:-auto}" in
+    none|off|0) ;;
+    auto)
+      if { command -v nvidia-ctk || command -v nvidia-container-runtime-hook; } >/dev/null 2>&1 \
+         && [[ -e /dev/nvidiactl ]]; then
+        gpu_args=(--gpus all -e NVIDIA_DRIVER_CAPABILITIES=all)
+      fi
+      ;;
+    *) gpu_args=(--gpus "$CF_GPUS" -e NVIDIA_DRIVER_CAPABILITIES=all) ;;
+  esac
+  echo "[+] GPU passthrough: ${gpu_args[*]:-off (NVIDIA Container Toolkit/driver not found, or CF_GPUS=none)}"
 
   local host_uid host_gid
   host_uid="$(id -u)"
@@ -159,8 +185,7 @@ DOCKERFILE
   # Mounted at the SAME absolute path as on the host: identical paths inside and
   # outside, and not under /root (mode 700, unreachable for a non-root user).
   docker run --privileged --network host \
-    --gpus all \
-    -e NVIDIA_DRIVER_CAPABILITIES=all \
+    "${gpu_args[@]}" \
     --device /dev/kvm --device /dev/vhost-vsock \
     -v /dev/log:/dev/log \
     -v "${mount_dir}:${mount_dir}" \
@@ -224,6 +249,38 @@ cmd_mount() {
       fi
       ;;
   esac
+}
+
+# ---- bash completion ------------------------------------------------------
+cmd_completion() {
+  cat <<'COMPLETION'
+# bash completion for cf
+_cf() {
+  local cur="${COMP_WORDS[COMP_CWORD]}"
+  local cmds="start stop rebuild remove launch shell default mount completion help"
+
+  if (( COMP_CWORD == 1 )); then
+    mapfile -t COMPREPLY < <(compgen -W "$cmds" -- "$cur")
+    return
+  fi
+
+  case "${COMP_WORDS[1]}" in
+    launch)      # cf launch [images_dir] [tools_dir]
+      if (( COMP_CWORD <= 3 )); then
+        mapfile -t COMPREPLY < <(compgen -d -- "$cur")
+        compopt -o filenames 2>/dev/null
+      fi ;;
+    default|mount)   # cf default|mount [dir | --reset]
+      if (( COMP_CWORD == 2 )); then
+        mapfile -t COMPREPLY < <(compgen -W "--reset" -- "$cur"; compgen -d -- "$cur")
+        compopt -o filenames 2>/dev/null
+      fi ;;
+    completion)
+      COMPREPLY=() ;;
+  esac
+}
+complete -F _cf cf
+COMPLETION
 }
 
 # ---- launch ---------------------------------------------------------------
@@ -303,6 +360,7 @@ case "$cmd" in
   shell)          cmd_shell ;;
   default)        cmd_default "$@" ;;
   mount)          cmd_mount "$@" ;;
+  completion)     cmd_completion ;;
   -h|--help|help) usage 0 ;;
   *)              usage 1 ;;
 esac
